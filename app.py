@@ -1,24 +1,55 @@
-"""Semantic Vault — Gradio 6 web interface."""
+"""Semantic Vault — Gradio 6 web interface (Phase 1 + Phase 2)."""
 from __future__ import annotations
 
 from dotenv import load_dotenv
 
-load_dotenv()  # must run before importing semantic_vault so settings picks up .env
+load_dotenv(".env")  # explicit path avoids find_dotenv frame-introspection issues
 
 import gradio as gr
 
 from semantic_vault.config import settings
 from semantic_vault.ingestion import ingest_text
-from semantic_vault.retrieval import _SYNTHESIS_PROMPT, _make_client
-from semantic_vault.storage import MetadataStore, VectorStore
+from semantic_vault.retrieval import (
+    _GRAPH_SECTION_TEMPLATE,
+    _SYNTHESIS_PROMPT,
+    _format_graph_rows,
+    _is_relational_query,
+    _make_client,
+)
+from semantic_vault.storage import EntityIndex, MetadataStore, VectorStore
 
 # ---------------------------------------------------------------------------
-# Persistent stores (live for the entire process lifetime)
+# Phase 1 stores (always active)
 # ---------------------------------------------------------------------------
 
 _vs = VectorStore(url=settings.qdrant_url)
 _ms = MetadataStore(db_path=settings.db_path)
 
+# ---------------------------------------------------------------------------
+# Phase 2 stores (active only when NEO4J_URI is configured)
+# ---------------------------------------------------------------------------
+
+_graph_store = None
+_entity_index = None
+_entity_resolver = None
+_graph_status = "Phase 1 only — set NEO4J_URI in .env to enable the knowledge graph."
+
+if settings.neo4j_uri:
+    try:
+        from semantic_vault.entity_resolver import EntityResolver
+        from semantic_vault.graph_store import GraphStore
+
+        _graph_store = GraphStore()
+        _graph_store.verify_connectivity()
+        _graph_store.create_indexes()
+        _entity_index = EntityIndex(_vs)
+        _entity_resolver = EntityResolver(_entity_index)
+        _graph_status = f"Knowledge graph connected ({settings.neo4j_uri.split('@')[-1]})"
+        print(f"✓ Neo4j connected: {settings.neo4j_uri}")
+    except Exception as _err:
+        print(f"  [warn] Neo4j unavailable — running Phase 1 only: {_err}")
+        _graph_store = _entity_index = _entity_resolver = None
+        _graph_status = f"Neo4j connection failed — Phase 1 only. ({_err})"
 
 # ---------------------------------------------------------------------------
 # Backend helpers
@@ -46,29 +77,48 @@ def _format_sources(hits: list[dict]) -> str:
 
 
 def add_knowledge(text: str, name: str):
-    """Ingest a document. Returns (status_markdown, library_markdown)."""
+    """Ingest a document (Phase 1 always; Phase 2 graph write when available)."""
     if not text.strip():
         return "⚠️ Please enter some text first.", _library_md()
 
     doc_name = name.strip() or f"note ({len(text):,} chars)"
     try:
-        doc = ingest_text(text, doc_name, _vs, _ms)
-        status = f"✅ **'{doc.name}'** added — {doc.chunk_count} chunk(s) indexed."
+        doc = ingest_text(
+            text,
+            doc_name,
+            _vs,
+            _ms,
+            entity_index=_entity_index,
+            graph_store=_graph_store,
+            entity_resolver=_entity_resolver,
+        )
+        graph_note = " (+ graph)" if _graph_store else ""
+        status = f"✅ **'{doc.name}'** added — {doc.chunk_count} chunk(s) indexed{graph_note}."
         return status, _library_md()
     except ValueError as exc:
         return f"⚠️ {exc}", _library_md()
 
 
 def handle_query(message: str, history: list[dict]):
-    """Streaming generator — retrieves chunks then streams Gemini's answer."""
+    """Streaming generator — vector search + optional graph retrieval."""
     message = message.strip()
     if not message:
         yield history + [{"role": "assistant", "content": "Please type a question."}], ""
         return
 
+    # ── Phase 1: vector retrieval ─────────────────────────────────────────
     hits = _vs.hybrid_search(message, top_k=settings.top_k)
 
-    if not hits:
+    # ── Phase 2: graph retrieval (relational queries only) ────────────────
+    graph_rows: list[dict] = []
+    if _graph_store is not None and _is_relational_query(message):
+        try:
+            client_for_graph = _make_client()
+            graph_rows, _ = _graph_store.text_to_cypher_query(message, client_for_graph)
+        except Exception as exc:
+            print(f"  [warn] graph retrieval: {exc}")
+
+    if not hits and not graph_rows:
         no_info = "No relevant information found in the knowledge base. Try adding some documents first."
         yield history + [
             {"role": "user", "content": message},
@@ -76,22 +126,31 @@ def handle_query(message: str, history: list[dict]):
         ], ""
         return
 
-    # Build context block
+    # ── Build synthesis prompt ────────────────────────────────────────────
     chunks_block = ""
     for i, h in enumerate(hits, start=1):
         chunks_block += f"\n[{i}] Source: {h['source_doc_name']}, chunk {h.get('chunk_index', '?')}\n{h['text']}\n"
 
-    prompt = _SYNTHESIS_PROMPT.format(chunks=chunks_block, question=message)
+    graph_section = ""
+    if graph_rows:
+        graph_section = _GRAPH_SECTION_TEMPLATE.format(facts=_format_graph_rows(graph_rows))
+
+    prompt = _SYNTHESIS_PROMPT.format(
+        chunks=chunks_block or "(none)",
+        graph_section=graph_section,
+        question=message,
+    )
+
     client = _make_client()
 
-    # Append user message + empty assistant placeholder immediately
+    # Show user message immediately with a thinking cursor
     history = history + [
         {"role": "user", "content": message},
         {"role": "assistant", "content": "▌"},
     ]
-    yield history, ""  # clears input, shows user message right away
+    yield history, ""
 
-    # Stream tokens
+    # ── Stream tokens ─────────────────────────────────────────────────────
     partial = ""
     stream = client.models.generate_content_stream(
         model=settings.gemini_synthesis_model,
@@ -103,7 +162,7 @@ def handle_query(message: str, history: list[dict]):
             history[-1] = {"role": "assistant", "content": partial}
             yield history, ""
 
-    # Append sources after streaming finishes
+    # Append sources block after streaming completes
     partial += _format_sources(hits)
     history[-1] = {"role": "assistant", "content": partial}
     yield history, ""
@@ -117,6 +176,7 @@ CSS = """
 #left-col  { border-right: 1px solid var(--border-color-primary); padding-right: 1.25rem; }
 #lib-box .prose { font-size: 0.85rem; line-height: 1.5; }
 #status    { min-height: 2rem; }
+#graph-badge { font-size: 0.78rem; opacity: 0.75; margin-top: 0.2rem; }
 footer     { display: none !important; }
 """
 
@@ -124,13 +184,19 @@ footer     { display: none !important; }
 # Layout
 # ---------------------------------------------------------------------------
 
+_graph_badge_color = "#2a9d4e" if _graph_store else "#888"
+_graph_badge_icon  = "🔗" if _graph_store else "○"
+
 with gr.Blocks(title="Semantic Vault") as demo:
 
-    gr.HTML("""
+    gr.HTML(f"""
     <div style="padding:0.75rem 0 0.25rem">
       <h1 style="font-size:1.55rem;font-weight:700;margin:0">🗄️ Semantic Vault</h1>
       <p style="margin:0.2rem 0 0;color:var(--body-text-color-subdued);font-size:0.92rem">
         Add anything you know &mdash; ask anything you need.
+      </p>
+      <p id="graph-badge" style="margin:0.3rem 0 0;color:{_graph_badge_color}">
+        {_graph_badge_icon} {_graph_status}
       </p>
     </div>
     """)
@@ -177,8 +243,9 @@ with gr.Blocks(title="Semantic Vault") as demo:
                     "<div style='text-align:center;padding:3rem 1rem;color:#999'>"
                     "<div style='font-size:2rem'>💬</div>"
                     "<div style='margin-top:.5rem'>Ask anything about your knowledge base.</div>"
-                    "<div style='font-size:.85rem;margin-top:.35rem'>Answers are grounded in what you've added.</div>"
-                    "</div>"
+                    "<div style='font-size:.85rem;margin-top:.35rem'>"
+                    "Answers are grounded in what you've added."
+                    "</div></div>"
                 ),
             )
 
@@ -191,7 +258,7 @@ with gr.Blocks(title="Semantic Vault") as demo:
                     max_lines=4,
                     autofocus=True,
                 )
-                ask_btn  = gr.Button("Ask ➤",  variant="primary", scale=1, min_width=75)
+                ask_btn   = gr.Button("Ask ➤",   variant="primary", scale=1, min_width=75)
                 clear_btn = gr.Button("🗑️ Clear", scale=1, min_width=90)
 
     # ── Events ────────────────────────────────────────────────────────────
@@ -201,7 +268,6 @@ with gr.Blocks(title="Semantic Vault") as demo:
         inputs=[text_input, name_input],
         outputs=[status_out, library_out],
     )
-
     ask_btn.click(
         fn=handle_query,
         inputs=[query_input, chatbot],
