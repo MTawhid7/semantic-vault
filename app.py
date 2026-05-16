@@ -194,9 +194,10 @@ def handle_query(message: str, history: list[dict]):
             for q in sub_qs:
                 if "dense" in strategies:
                     futures[ex.submit(_vs.hybrid_search, q, search_k)] = ("dense", q)
-                if "graph" in strategies and _graph_store:
-                    futures[ex.submit(_graph_store.text_to_cypher_query, q, client)] = ("graph", q)
-            for f in _as(futures, timeout=15):
+            # Graph only for the original (first) sub-question to avoid N×Gemini calls
+            if "graph" in strategies and _graph_store and sub_qs:
+                futures[ex.submit(_graph_store.text_to_cypher_query, sub_qs[0], client)] = ("graph", sub_qs[0])
+            for f in _as(futures, timeout=30):
                 kind, _ = futures[f]
                 try:
                     res = f.result()

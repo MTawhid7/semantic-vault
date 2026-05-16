@@ -57,6 +57,10 @@ class VectorStore:
 
         self._embed_fn = embed_fn
         self._dim = settings.gemini_embed_dim
+        # In-process cache: same text always yields the same vector within a session.
+        # Eliminates duplicate Gemini calls when EntityIndex.search() and .upsert()
+        # both embed the same "{name} ({type})" string for a new entity.
+        self._embed_cache: dict[str, list[float]] = {}
         self._ensure_collection()
 
     # ------------------------------------------------------------------
@@ -64,10 +68,28 @@ class VectorStore:
     # ------------------------------------------------------------------
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Return a dense embedding vector for each text in *texts*."""
+        """Return a dense embedding vector for each text, with in-process caching."""
         if self._embed_fn is not None:
             return self._embed_fn(texts)
-        return self._gemini_embed(texts)
+
+        results: list[list[float] | None] = [None] * len(texts)
+        uncached_texts: list[str] = []
+        uncached_indices: list[int] = []
+
+        for i, text in enumerate(texts):
+            if text in self._embed_cache:
+                results[i] = self._embed_cache[text]
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
+
+        if uncached_texts:
+            new_vecs = self._gemini_embed(uncached_texts)
+            for idx, text, vec in zip(uncached_indices, uncached_texts, new_vecs):
+                self._embed_cache[text] = vec
+                results[idx] = vec
+
+        return results  # type: ignore[return-value]
 
     def _gemini_embed(self, texts: list[str]) -> list[list[float]]:
         client = genai.Client(api_key=settings.gemini_api_key)

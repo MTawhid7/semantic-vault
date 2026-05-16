@@ -106,10 +106,15 @@ def _retrieve_parallel(
         for q in sub_questions:
             if "dense" in strategies:
                 futures[ex.submit(do_dense, q)] = ("dense", q)
-            if "graph" in strategies and graph_store is not None:
-                futures[ex.submit(do_graph, q)] = ("graph", q)
 
-        for future in as_completed(futures, timeout=15):
+        # Graph retrieval runs only for the first (original) sub-question.
+        # Running Text2Cypher for every sub-question multiplies Gemini calls by N
+        # and risks hitting rate limits or the parallel timeout on free-tier APIs.
+        if "graph" in strategies and graph_store is not None and sub_questions:
+            q0 = sub_questions[0]
+            futures[ex.submit(do_graph, q0)] = ("graph", q0)
+
+        for future in as_completed(futures, timeout=30):
             kind, q = futures[future]
             try:
                 result = future.result()
