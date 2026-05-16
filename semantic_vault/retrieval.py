@@ -15,9 +15,18 @@ from .models import QueryResult
 from .storage import VectorStore
 
 _SYNTHESIS_PROMPT = """\
-Answer the user's question using ONLY the retrieved knowledge below.
-Be precise and factual. If the knowledge is insufficient, say so explicitly.
-Include inline citations in the format [Source: <doc_name>, chunk <N>].
+Answer the user's question using the retrieved knowledge below as your evidence.
+
+Rules:
+- Cite every factual claim inline as [Source: <doc_name>, chunk <N>].
+- You may reason over the evidence and draw well-supported inferences, including indirect
+  or multi-hop connections (e.g. A works with B, B is connected to C means A is indirectly
+  linked to C). Label inferences clearly: "This implies..." or "Indirectly, ...".
+- If two sources contradict each other, present both versions and flag the conflict.
+- If the evidence is genuinely insufficient, say so and explain what is missing. Do not
+  say "no connection exists" when evidence of an indirect connection is present — instead
+  describe the indirect path you found.
+- Be exhaustive: include all relevant names, numbers, dates, and roles from the evidence.
 
 Retrieved chunks:
 {chunks}

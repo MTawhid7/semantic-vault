@@ -88,25 +88,24 @@ class GraphStore:
         entity_type: str,
         aliases: list[str] | None = None,
     ) -> None:
-        """Create or update an Entity node (idempotent via MERGE)."""
+        """Create or update an Entity node (idempotent via MERGE).
+
+        Uses ON CREATE / ON MATCH to avoid the deprecated CALL subquery syntax.
+        """
+        all_aliases = list({name} | set(aliases or []))
         with self._driver.session() as s:
             s.run(
                 """
                 MERGE (e:Entity {canonical_id: $id})
-                SET e.name = $name, e.type = $type
-                WITH e, $aliases AS new_aliases
-                CALL {
-                    WITH e, new_aliases
-                    UNWIND new_aliases AS alias
-                    WITH e, alias
-                    WHERE NOT alias IN coalesce(e.aliases, [])
-                    SET e.aliases = coalesce(e.aliases, []) + [alias]
-                }
+                ON CREATE SET e.name = $name, e.type = $type, e.aliases = $aliases
+                ON MATCH SET  e.name = $name, e.type = $type,
+                              e.aliases = coalesce(e.aliases, []) +
+                                [a IN $aliases WHERE NOT a IN coalesce(e.aliases, [])]
                 """,
                 id=canonical_id,
                 name=name,
                 type=entity_type,
-                aliases=list({name} | set(aliases or [])),
+                aliases=all_aliases,
             )
 
     def add_alias(self, canonical_id: str, alias: str) -> None:
