@@ -18,25 +18,10 @@ Semantic Vault is being built in three phases, each independently shippable. Eac
 | Web UI | Gradio 6 (two-panel split layout) |
 | CLI | Python argparse |
 
-### Pipeline
-
-```
-Raw text
-  → sentence-boundary chunker (overlap)
-  → Gemini: extract entities / facts / summary / topics (structured JSON)
-  → Gemini: embed chunk → 3072-dim dense vector
-  → Qdrant: store point (vector + full metadata payload)
-  → SQLite: store document record
-
-Query
-  → Gemini: embed query
-  → Qdrant: cosine similarity top-K
-  → Gemini: synthesise answer with inline citations
-```
-
 ### Capabilities
 - Ingest any plaintext, notes, articles, research
 - Automatic entity extraction (Person, Organization, Location, Event, Concept, Document, Product, Date)
+- Relationship extraction (subject → predicate → object triples)
 - Semantic search across all ingested content
 - Cited answers grounded in stored knowledge
 - Duplicate detection (SHA-256 content hash)
@@ -44,134 +29,94 @@ Query
 - Persistent storage (qdrant_db/ + semantic_vault.db)
 - Full test suite: 46 tests, no API key required for unit/integration tests
 
-### Known limitations (resolved in Phase 2)
-- No explicit relationships between entities — only similarity-based retrieval
-- No entity deduplication ("Alice Johnson" and "Alice" are separate entities)
-- No multi-hop reasoning ("Who are Alice's colleagues?" requires graph traversal)
-- Schema is fixed to the base 8 entity types
-
 ---
 
-## 🔲 Phase 2 — Knowledge Graph
+## ✅ Phase 2 — Knowledge Graph (complete)
 
-**Goal:** Add explicit entity relationships and multi-hop reasoning. Answer questions like *"Who does Alice collaborate with?"* and *"Which organisations are related to Project X?"*
+**Goal:** Add explicit entity relationships and multi-hop reasoning.
 
-### New stack additions
+### Stack additions
 | Component | Technology |
 |---|---|
-| Graph database | Neo4j (local or AuraDB free tier) |
+| Graph database | Neo4j AuraDB Free / local Community |
 | Graph driver | `neo4j` Python driver |
+| Entity index | Qdrant `entity_vectors` collection (ANN blocking) |
 
-### New pipeline steps
-
+### Pipeline
 ```
 After extraction:
   → Entity Resolution (3-stage):
-      1. Embedding similarity blocking (≥ 0.85 cosine → candidate merge)
-      2. Gemini disambiguation for ambiguous pairs (0.65–0.85 range)
-      3. Canonical node management (one UUID per entity, aliases stored)
+      1. Embedding blocking — ANN search in entity_vectors (≥0.85 cosine → merge)
+      2. Gemini LLM disambiguation — for ambiguous pairs (0.65–0.85 range)
+      3. Canonical management — one UUID per entity, aliases accumulated
   → Graph write (Neo4j):
-      - Create/merge entity nodes with properties
-      - Create typed relationship edges with confidence + provenance
-      - Store source_chunk_id, extracted_at, confidence on each edge
+      - MERGE entity nodes with name/type/aliases
+      - CREATE RELATES_TO edges: predicate, confidence, valid_from/to, source_chunk_id
+      - CONTRADICTS edges when conflicting facts detected
 
-Retrieval additions:
-  → Query decomposition: detect relationship questions
-  → Graph traversal (Cypher, 1–3 hops) for relationship-aware answers
-  → Result fusion: combine vector hits + graph hits before synthesis
+Query path:
+  → _is_relational_query() heuristic classifier
+  → Gemini Text2Cypher for relational queries → Neo4j execution
+  → Vector results + graph facts merged in synthesis prompt
 ```
-
-### Data model
-
-```
-(:Person {name, aliases[], canonical_id})
-  -[:WORKS_AT {confidence, since, source_chunk_id}]->
-(:Organization {name, type, canonical_id})
-
-(:Chunk {id}) -[:MENTIONS]-> (:Entity)
-(:SourceDocument {id}) -[:CONTAINS]-> (:Chunk)
-```
-
-### Bi-temporal provenance
-Every fact edge carries:
-- `valid_from`, `valid_to` — when the fact was true in the world
-- `extracted_at` — when we learned it
-- `confidence` — extraction confidence score
-- `source_chunk_id` — which chunk is the evidence
-
-Conflicting facts are never deleted — a `CONTRADICTS` edge links them. Resolution happens at query time (recency + confidence weighting).
 
 ### New capabilities
 - "Who works with Alice?" → graph traversal
-- "What organisations is this concept related to?" → multi-hop
-- Entity deduplication: "Alice Johnson", "Alice", "A. Johnson" → one canonical node
-- Conflict tracking: two sources disagree → answer flags the contradiction
-- Provenance: every answer traces back to exact source chunks
+- Multi-hop connection queries (1–3 hops)
+- Entity deduplication: "Dr. Sarah Chen" / "S. Chen" → one canonical node
+- Conflict tracking: two sources disagree → answer flags both with sources
+- Provenance: every relationship traces to exact source chunk
+- `rebuild-graph` CLI command for retroactive graph population
+- Full extraction payload cached in Qdrant for fast graph rebuilds
+
+### Test count: 90 (all passing, no API key required for unit/integration)
 
 ---
 
-## 🔲 Phase 3 — Adaptive System
+## ✅ Phase 3 — Adaptive System (complete)
 
-**Goal:** Self-organising schema, agentic retrieval, and continuous refinement. The system grows smarter as more data is added.
+**Goal:** Self-organising schema, agentic retrieval, source authority, and continuous refinement.
 
-### New stack additions
+### Stack additions
 | Component | Technology |
 |---|---|
-| Schema registry | PostgreSQL (replaces SQLite) |
-| Async job queue | Redis Streams or Celery |
-| Reranker | ColBERT via `ragatouille` or LLM-as-judge |
+| Query planner | Gemini structured output (`QueryPlan`) |
+| Parallel retrieval | `concurrent.futures.ThreadPoolExecutor` |
+| Reranker | Gemini LLM-as-judge (scores chunks 1–5) |
+| Authority scorer | SQLite `source_authority` table |
+| Ontology engine | Cosine-threshold clustering + Gemini type naming |
+| Schema registry | SQLite `schema_registry` table |
 
-### Ontology evolution
-
+### Pipeline
 ```
-Background worker (every N documents):
-  → Cluster entity embeddings with Leiden algorithm
-  → Detect emerging clusters not covered by existing types
-  → Propose new type name (Gemini-generated from cluster members)
-  → Queue retroactive re-extraction for affected documents
-  → Add type to schema registry with version bump
-```
+Query
+  → QueryPlanner: decompose into sub-questions, classify intent,
+    select strategies (dense / graph / structured)
+  → Parallel retrieval:
+      Thread 1: dense vector search per sub-question
+      Thread 2: graph traversal (if relational)
+      Thread 3: structured filter (if temporal/exact)
+  → RRF fusion across all vector result lists
+  → LLM reranker: score top-20 chunks → return top-K
+  → Synthesis with authority-weighted conflict resolution
 
-Type explosion is prevented by:
-- Hard budget: max N types per depth level
-- Type subsumption hierarchy (`Drug → Compound → Substance`)
-- Confidence threshold before a new type is promoted
-
-### Agentic retrieval
-
-```
-User query
-  → Planner agent: decompose into sub-questions, classify intent
-  → Retriever agents (parallel):
-      - Dense vector search (Qdrant)
-      - Graph traversal (Neo4j Cypher)
-      - Structured filter (PostgreSQL — dates, entity names)
-  → RRF fusion + ColBERT reranking
-  → Synthesiser agent: generate answer with inline citations
-```
-
-### Source authority scoring
-Every document source gets a trust score based on:
-- How often its facts are corroborated by other sources
-- Whether its facts have been contradicted
-- Recency of the information
-
-### Conflict resolution pipeline
-```
-Conflicting facts detected at ingest:
-  → Store both with CONTRADICTS edge
-  → Score by: source authority × recency × confidence
-  → At query time: synthesiser presents both versions if unresolvable
-  → Background job: flag high-confidence contradictions for user review
+Background (every N ingestions):
+  → OntologyEngine clusters Concept entities by cosine similarity
+  → Proposes new type names for large clusters (≥ threshold)
+  → Updates schema registry with version bump
+  → Queues retroactive re-extraction for affected documents
 ```
 
 ### New capabilities
-- New knowledge domains auto-recognised and typed
-- Retroactive re-extraction when schema evolves (without full reprocessing)
-- Multi-agent query decomposition for complex questions
-- Conflict-aware answers that cite disagreements
-- Source credibility model
-- p50 query latency target: < 2s (Phase 1: immediate); < 5s (Phase 3: agentic)
+- **Agentic query decomposition**: multi-part questions split and answered jointly
+- **Parallel retrieval**: dense + graph + structured fire concurrently, not sequentially
+- **RRF fusion**: Reciprocal Rank Fusion merges multiple result lists without score scaling
+- **LLM reranking**: relevance-scored re-ordering beyond embedding cosine
+- **Source authority**: corroboration-based trust scores weight conflict resolution
+- **Ontology evolution**: Concept entities cluster into new typed ontology entries
+- **Schema registry**: versioned type history, subsumption hierarchy, example entities
+
+### Test count: 130+ (all passing)
 
 ---
 

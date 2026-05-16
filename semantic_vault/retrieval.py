@@ -1,12 +1,15 @@
 """Retrieval pipeline: query → search → LLM synthesis.
 
 Phase 1: vector search → synthesis.
-Phase 2: adds a graph traversal branch for relational queries; results are
-         merged before synthesis.
+Phase 2: graph traversal branch for relational queries.
+Phase 3: query planning, parallel retrieval, RRF fusion, LLM reranking,
+         source authority weighting.
 """
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 from google import genai
 
@@ -31,6 +34,7 @@ Rules:
 Retrieved chunks:
 {chunks}
 {graph_section}
+{authority_section}
 Question: {question}
 """
 
@@ -39,16 +43,15 @@ Knowledge-graph facts (entity relationships):
 {facts}
 """
 
-# Heuristic keywords that suggest a relational query (graph branch)
+# Heuristic keywords that suggest a relational query (Phase 2 graph branch)
 _RELATIONAL_PATTERNS = re.compile(
     r"\b(who (does|did|is|are|was|were)|"
-    r"related to|connected to|works? with|collaborated? with|"
+    r"related to|connected to|works? with|collaborat\w* with|"
     r"partners? of|colleagues? of|member of|belongs? to|"
     r"linked to|associated with|relationship between|"
     r"how is .+ related|which (company|organization|person|people)|"
     r"what (company|organization|group)|report(s|ed)? to|"
-    r"founded by|acquired by|owned by|"
-    r"collaborat\w* with)\b",
+    r"founded by|acquired by|owned by)\b",
     re.IGNORECASE,
 )
 
@@ -66,10 +69,64 @@ def _format_graph_rows(rows: list[dict]) -> str:
         return ""
     lines = []
     for row in rows[:20]:
-        # Try to render in a readable way regardless of exact column names
         lines.append("  • " + " | ".join(f"{k}: {v}" for k, v in row.items() if v is not None))
     return "\n".join(lines)
 
+
+# ---------------------------------------------------------------------------
+# Phase 3: parallel retrieval + RRF fusion
+# ---------------------------------------------------------------------------
+
+def _retrieve_parallel(
+    sub_questions: list[str],
+    strategies: list[str],
+    vector_store: VectorStore,
+    graph_store: Any,
+    client: genai.Client,
+    top_k: int,
+) -> tuple[list[list[dict]], list[dict]]:
+    """Execute retrieval strategies in parallel for all sub-questions.
+
+    Returns (vector_result_lists, graph_rows).
+    """
+    vector_results: dict[str, list[dict]] = {}
+    graph_rows: list[dict] = []
+
+    def do_dense(q: str) -> list[dict]:
+        return vector_store.hybrid_search(q, top_k=top_k * 2)
+
+    def do_graph(q: str) -> list[dict]:
+        if graph_store is None:
+            return []
+        rows, _ = graph_store.text_to_cypher_query(q, client)
+        return rows
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for q in sub_questions:
+            if "dense" in strategies:
+                futures[ex.submit(do_dense, q)] = ("dense", q)
+            if "graph" in strategies and graph_store is not None:
+                futures[ex.submit(do_graph, q)] = ("graph", q)
+
+        for future in as_completed(futures, timeout=15):
+            kind, q = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"  [warn] {kind} retrieval failed for '{q[:40]}': {exc}")
+                result = []
+            if kind == "dense":
+                vector_results[q] = result
+            else:
+                graph_rows.extend(result)
+
+    return list(vector_results.values()), graph_rows
+
+
+# ---------------------------------------------------------------------------
+# Main retrieval function
+# ---------------------------------------------------------------------------
 
 def retrieve_and_synthesize(
     query: str,
@@ -78,23 +135,62 @@ def retrieve_and_synthesize(
     top_k: int | None = None,
     entity_type_filter: str | None = None,
     gemini_client: genai.Client | None = None,
-    graph_store=None,  # GraphStore | None  (avoid circular import)
+    graph_store: Any = None,
+    # Phase 3 optional components
+    query_planner: Any = None,   # QueryPlanner | None
+    authority_scorer: Any = None,  # AuthorityScorer | None
+    rerank: bool | None = None,
 ) -> QueryResult:
-    """Search the knowledge base and synthesise a grounded answer with Gemini."""
+    """Search the knowledge base and synthesise a grounded answer with Gemini.
+
+    Phase 3 features activate when the corresponding component is supplied
+    (query_planner, authority_scorer) or flag is True (rerank).
+    """
+    from .reranker import llm_rerank, rrf_fuse
+
     k = top_k if top_k is not None else settings.top_k
     client = gemini_client or _make_client()
+    do_rerank = rerank if rerank is not None else settings.enable_reranking
 
-    # ── Phase 1: vector search ────────────────────────────────────────────
-    hits = vector_store.hybrid_search(query, top_k=k, entity_type_filter=entity_type_filter)
+    # ── Phase 3: query planning ────────────────────────────────────────────
+    plan = None
+    if query_planner is not None:
+        plan = query_planner.plan(query)
+        sub_questions = plan.sub_questions
+        strategies = plan.strategies
+        if plan.needs_reranking:
+            do_rerank = True
+    else:
+        sub_questions = [query]
+        strategies = ["dense"]
+        if graph_store is not None and _is_relational_query(query):
+            strategies.append("graph")
 
-    # ── Phase 2: graph retrieval (when graph store available + relational Q) ─
-    graph_rows: list[dict] = []
-    cypher_used = ""
-    if graph_store is not None and _is_relational_query(query):
-        try:
-            graph_rows, cypher_used = graph_store.text_to_cypher_query(query, client)
-        except Exception as exc:
-            print(f"  [warn] graph retrieval failed: {exc}")
+    # ── Parallel retrieval (Phase 3) or sequential (Phase 1/2) ────────────
+    if len(sub_questions) > 1 or len(strategies) > 1:
+        vector_result_lists, graph_rows = _retrieve_parallel(
+            sub_questions, strategies, vector_store, graph_store, client, k
+        )
+        hits = rrf_fuse(vector_result_lists)[:k * 2]
+    else:
+        # When reranking, fetch extra candidates beyond top_k to give the reranker
+        # something to work with — otherwise len(hits) == top_k → reranker skips.
+        search_k = max(settings.rerank_top_n, k * 2) if do_rerank else k
+        hits = vector_store.hybrid_search(
+            query, top_k=search_k, entity_type_filter=entity_type_filter
+        )
+        graph_rows = []
+        if graph_store is not None and _is_relational_query(query):
+            try:
+                graph_rows, _ = graph_store.text_to_cypher_query(query, client)
+            except Exception as exc:
+                print(f"  [warn] graph retrieval failed: {exc}")
+
+    # ── Phase 3: LLM reranking ─────────────────────────────────────────────
+    if do_rerank and len(hits) > k:
+        hits = llm_rerank(query, hits, client, top_k=k, max_chunks_to_score=settings.rerank_top_n)
+    else:
+        hits = hits[:k]
 
     if not hits and not graph_rows:
         return QueryResult(
@@ -104,10 +200,11 @@ def retrieve_and_synthesize(
             graph_facts=[],
         )
 
-    # ── Build prompt context ──────────────────────────────────────────────
+    # ── Build synthesis prompt ─────────────────────────────────────────────
     chunks_block = ""
     sources: list[dict] = []
     all_entity_names: list[str] = []
+    doc_names_seen: list[str] = []
 
     for i, hit in enumerate(hits, start=1):
         doc_name = hit.get("source_doc_name", "unknown")
@@ -126,14 +223,22 @@ def retrieve_and_synthesize(
             }
         )
         all_entity_names.extend(hit.get("entity_names", []))
+        if doc_name not in doc_names_seen:
+            doc_names_seen.append(doc_name)
 
     graph_section = ""
     if graph_rows:
         graph_section = _GRAPH_SECTION_TEMPLATE.format(facts=_format_graph_rows(graph_rows))
 
+    # ── Phase 3: source authority section ─────────────────────────────────
+    authority_section = ""
+    if authority_scorer is not None and doc_names_seen:
+        authority_section = authority_scorer.format_for_prompt(doc_names_seen)
+
     prompt = _SYNTHESIS_PROMPT.format(
         chunks=chunks_block or "(none)",
         graph_section=graph_section,
+        authority_section=authority_section,
         question=query,
     )
 

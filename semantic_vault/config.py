@@ -27,5 +27,12 @@ class Settings(BaseSettings):
     er_high_threshold: float = 0.85   # cosine ≥ this → definite match
     er_low_threshold: float = 0.65    # cosine < this → definitely new entity
 
+    # Phase 3 — agentic retrieval
+    enable_query_planner: bool = False   # decompose queries with Gemini
+    enable_reranking: bool = False       # LLM-as-judge reranking
+    rerank_top_n: int = 20               # candidates sent to reranker
+    enable_authority: bool = False       # source authority weighting
+    ontology_evolution_interval: int = 10  # run evolution every N ingestions
+
 
 settings = Settings()
