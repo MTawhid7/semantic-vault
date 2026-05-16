@@ -134,8 +134,21 @@ class VectorStore:
                 "summary": ex.summary if ex else "",
                 "topics": ex.topics if ex else [],
                 "key_facts": ex.key_facts if ex else [],
+                # Flat lists used for Qdrant payload filtering
                 "entity_names": [e.name for e in ex.entities] if ex else [],
                 "entity_types": list({e.type for e in ex.entities}) if ex else [],
+                # Full extraction data stored so graph can be rebuilt without re-extraction
+                "entities": [
+                    {"name": e.name, "type": e.type,
+                     "aliases": e.aliases, "confidence": e.confidence}
+                    for e in ex.entities
+                ] if ex else [],
+                "relationships": [
+                    {"subject": r.subject, "predicate": r.predicate, "object": r.object,
+                     "confidence": r.confidence,
+                     "valid_from": r.valid_from, "valid_to": r.valid_to}
+                    for r in ex.relationships
+                ] if ex else [],
             }
             points.append(PointStruct(id=chunk.id, vector={"dense": vec}, payload=payload))
 
@@ -169,6 +182,27 @@ class VectorStore:
             with_payload=True,
         )
         return [{"id": str(r.id), "score": r.score, **r.payload} for r in response.points]
+
+    def get_chunks_by_doc_id(self, source_doc_id: str) -> list[dict[str, Any]]:
+        """Return all chunk payloads for a given document, ordered by chunk_index."""
+        results: list[dict[str, Any]] = []
+        offset = None
+        while True:
+            points, next_offset = self._client.scroll(
+                collection_name=_COLLECTION,
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="source_doc_id", match=MatchValue(value=source_doc_id))]
+                ),
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            results.extend({"id": str(p.id), **p.payload} for p in points)
+            if next_offset is None:
+                break
+            offset = next_offset
+        return sorted(results, key=lambda c: c.get("chunk_index", 0))
 
     def count(self) -> int:
         return self._client.count(collection_name=_COLLECTION).count
