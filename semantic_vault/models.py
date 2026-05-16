@@ -18,8 +18,19 @@ class ExtractedEntity(BaseModel):
     confidence: float = Field(default=0.8, ge=0.0, le=1.0)
 
 
+class ExtractedRelationship(BaseModel):
+    """A directed semantic relationship between two named entities."""
+    subject: str    # entity name — must appear in entities[]
+    predicate: str  # ALL_CAPS_UNDERSCORED verb, e.g. WORKS_AT, FOUNDED, LOCATED_IN
+    object: str     # entity name — must appear in entities[]
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    valid_from: str = ""  # ISO-8601 date string if stated; otherwise empty
+    valid_to: str = ""    # ISO-8601 date string if stated; otherwise empty
+
+
 class ExtractionOutput(BaseModel):
     entities: list[ExtractedEntity]
+    relationships: list[ExtractedRelationship] = Field(default_factory=list)
     key_facts: list[str]
     summary: str
     topics: list[str]
@@ -46,3 +57,4 @@ class QueryResult(BaseModel):
     answer: str
     sources: list[dict[str, Any]]
     entities_mentioned: list[str]
+    graph_facts: list[dict[str, Any]] = Field(default_factory=list)  # Phase 2 graph hits

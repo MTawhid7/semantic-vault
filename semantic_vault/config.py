@@ -18,5 +18,14 @@ class Settings(BaseSettings):
 
     top_k: int = 8
 
+    # Phase 2 — Neo4j knowledge graph (leave blank to disable graph features)
+    neo4j_uri: str = ""
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
+
+    # Entity resolution thresholds
+    er_high_threshold: float = 0.85   # cosine ≥ this → definite match
+    er_low_threshold: float = 0.65    # cosine < this → definitely new entity
+
 
 settings = Settings()

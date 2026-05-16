@@ -1,5 +1,12 @@
-"""Retrieval pipeline: query → hybrid search → LLM synthesis."""
+"""Retrieval pipeline: query → search → LLM synthesis.
+
+Phase 1: vector search → synthesis.
+Phase 2: adds a graph traversal branch for relational queries; results are
+         merged before synthesis.
+"""
 from __future__ import annotations
+
+import re
 
 from google import genai
 
@@ -8,19 +15,51 @@ from .models import QueryResult
 from .storage import VectorStore
 
 _SYNTHESIS_PROMPT = """\
-Answer the user's question using ONLY the retrieved knowledge chunks below.
-Be precise and factual. If the chunks contain insufficient information, say so explicitly.
+Answer the user's question using ONLY the retrieved knowledge below.
+Be precise and factual. If the knowledge is insufficient, say so explicitly.
 Include inline citations in the format [Source: <doc_name>, chunk <N>].
 
 Retrieved chunks:
 {chunks}
-
+{graph_section}
 Question: {question}
 """
+
+_GRAPH_SECTION_TEMPLATE = """\
+Knowledge-graph facts (entity relationships):
+{facts}
+"""
+
+# Heuristic keywords that suggest a relational query (graph branch)
+_RELATIONAL_PATTERNS = re.compile(
+    r"\b(who (does|did|is|are|was|were)|"
+    r"related to|connected to|works? with|collaborated? with|"
+    r"partners? of|colleagues? of|member of|belongs? to|"
+    r"linked to|associated with|relationship between|"
+    r"how is .+ related|which (company|organization|person|people)|"
+    r"what (company|organization|group)|report(s|ed)? to|"
+    r"founded by|acquired by|owned by|"
+    r"collaborat\w* with)\b",
+    re.IGNORECASE,
+)
 
 
 def _make_client() -> genai.Client:
     return genai.Client(api_key=settings.gemini_api_key)
+
+
+def _is_relational_query(question: str) -> bool:
+    return bool(_RELATIONAL_PATTERNS.search(question))
+
+
+def _format_graph_rows(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    lines = []
+    for row in rows[:20]:
+        # Try to render in a readable way regardless of exact column names
+        lines.append("  • " + " | ".join(f"{k}: {v}" for k, v in row.items() if v is not None))
+    return "\n".join(lines)
 
 
 def retrieve_and_synthesize(
@@ -30,20 +69,33 @@ def retrieve_and_synthesize(
     top_k: int | None = None,
     entity_type_filter: str | None = None,
     gemini_client: genai.Client | None = None,
+    graph_store=None,  # GraphStore | None  (avoid circular import)
 ) -> QueryResult:
-    """Search the vector store and synthesise an answer with Gemini."""
+    """Search the knowledge base and synthesise a grounded answer with Gemini."""
     k = top_k if top_k is not None else settings.top_k
     client = gemini_client or _make_client()
 
+    # ── Phase 1: vector search ────────────────────────────────────────────
     hits = vector_store.hybrid_search(query, top_k=k, entity_type_filter=entity_type_filter)
 
-    if not hits:
+    # ── Phase 2: graph retrieval (when graph store available + relational Q) ─
+    graph_rows: list[dict] = []
+    cypher_used = ""
+    if graph_store is not None and _is_relational_query(query):
+        try:
+            graph_rows, cypher_used = graph_store.text_to_cypher_query(query, client)
+        except Exception as exc:
+            print(f"  [warn] graph retrieval failed: {exc}")
+
+    if not hits and not graph_rows:
         return QueryResult(
             answer="No relevant information found in the knowledge base.",
             sources=[],
             entities_mentioned=[],
+            graph_facts=[],
         )
 
+    # ── Build prompt context ──────────────────────────────────────────────
     chunks_block = ""
     sources: list[dict] = []
     all_entity_names: list[str] = []
@@ -53,7 +105,6 @@ def retrieve_and_synthesize(
         chunk_idx = hit.get("chunk_index", "?")
         text = hit.get("text", "")
         chunks_block += f"\n[{i}] Source: {doc_name}, chunk {chunk_idx}\n{text}\n"
-
         sources.append(
             {
                 "rank": i,
@@ -67,7 +118,16 @@ def retrieve_and_synthesize(
         )
         all_entity_names.extend(hit.get("entity_names", []))
 
-    prompt = _SYNTHESIS_PROMPT.format(chunks=chunks_block, question=query)
+    graph_section = ""
+    if graph_rows:
+        graph_section = _GRAPH_SECTION_TEMPLATE.format(facts=_format_graph_rows(graph_rows))
+
+    prompt = _SYNTHESIS_PROMPT.format(
+        chunks=chunks_block or "(none)",
+        graph_section=graph_section,
+        question=query,
+    )
+
     response = client.models.generate_content(
         model=settings.gemini_synthesis_model,
         contents=prompt,
@@ -76,5 +136,6 @@ def retrieve_and_synthesize(
     return QueryResult(
         answer=response.text,
         sources=sources,
-        entities_mentioned=list(dict.fromkeys(all_entity_names)),  # deduplicated, ordered
+        entities_mentioned=list(dict.fromkeys(all_entity_names)),
+        graph_facts=graph_rows,
     )

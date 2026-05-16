@@ -25,6 +25,7 @@ from .config import settings
 from .models import Chunk, SourceDocument
 
 _COLLECTION = "chunks"
+_ENTITY_COLLECTION = "entity_vectors"
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +172,85 @@ class VectorStore:
 
     def count(self) -> int:
         return self._client.count(collection_name=_COLLECTION).count
+
+
+# ---------------------------------------------------------------------------
+# Entity index — separate Qdrant collection for entity-resolution blocking
+# ---------------------------------------------------------------------------
+
+
+class EntityIndex:
+    """Stores one embedding per canonical entity for ANN-based resolution blocking.
+
+    Shares the Qdrant client and embed function of a parent VectorStore so that
+    no extra connections or API clients are needed.
+    """
+
+    def __init__(self, vector_store: VectorStore) -> None:
+        self._qdrant = vector_store._client
+        self._embed = vector_store.embed
+        self._dim = vector_store._dim
+        self._ensure_collection()
+
+    def _ensure_collection(self) -> None:
+        existing = {c.name for c in self._qdrant.get_collections().collections}
+        if _ENTITY_COLLECTION not in existing:
+            self._qdrant.create_collection(
+                collection_name=_ENTITY_COLLECTION,
+                vectors_config={"dense": VectorParams(size=self._dim, distance=Distance.COSINE)},
+            )
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def upsert(self, canonical_id: str, name: str, entity_type: str, context: str = "") -> None:
+        """Store or refresh the embedding for a canonical entity.
+
+        Only name + type are embedded (not context) so that the same entity
+        always produces the same vector regardless of which document it appears in.
+        Context is used by the LLM disambiguation stage, not the blocking stage.
+        """
+        query_text = f"{name} ({entity_type})"
+        vec = self._embed([query_text])[0]
+        self._qdrant.upsert(
+            collection_name=_ENTITY_COLLECTION,
+            points=[
+                PointStruct(
+                    id=canonical_id,
+                    vector={"dense": vec},
+                    payload={"canonical_id": canonical_id, "name": name, "type": entity_type},
+                )
+            ],
+        )
+
+    # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
+
+    def search(self, name: str, entity_type: str = "", context: str = "", top_k: int = 5) -> list[dict[str, Any]]:
+        """Return up to *top_k* existing entities ranked by similarity."""
+        query_text = f"{name} ({entity_type})" if entity_type else name
+        vec = self._embed([query_text])[0]
+        response = self._qdrant.query_points(
+            collection_name=_ENTITY_COLLECTION,
+            query=vec,
+            using="dense",
+            limit=top_k,
+            with_payload=True,
+        )
+        return [
+            {
+                "canonical_id": r.payload["canonical_id"],
+                "name": r.payload["name"],
+                "type": r.payload.get("type", ""),
+                "score": r.score,
+            }
+            for r in response.points
+        ]
+
+    def count(self) -> int:
+        return self._qdrant.count(collection_name=_ENTITY_COLLECTION).count
 
 
 # ---------------------------------------------------------------------------
